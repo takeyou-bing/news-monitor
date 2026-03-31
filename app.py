@@ -1,5 +1,5 @@
 """
-네이버 뉴스 → 텔레그램 모니터링 봇 (Render 안정화 버전)
+네이버 뉴스 → 텔레그램 모니터링 봇 (Render 안정화 버전 v2)
 pip install streamlit requests
 """
 
@@ -17,11 +17,12 @@ import urllib3
 urllib3.disable_warnings()
 
 # ─────────────────────────────────────────
-# 설정
+# 파일 경로
 # ─────────────────────────────────────────
-CONFIG_FILE = Path("config.json")
-CACHE_FILE  = Path("sent_articles.json")
-LOG_FILE    = Path("monitor.log")
+CONFIG_FILE  = Path("config.json")
+CACHE_FILE   = Path("sent_articles.json")
+LOG_FILE     = Path("monitor.log")
+THREAD_FLAG  = Path("thread.lock")  # 스레드 중복 방지 플래그
 
 DEFAULT_CONFIG = {
     "naver_client_id":     "",
@@ -35,6 +36,9 @@ DEFAULT_CONFIG = {
     "running":             False,
 }
 
+# ─────────────────────────────────────────
+# 설정 / 캐시 / 로그
+# ─────────────────────────────────────────
 def load_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -58,15 +62,13 @@ def save_cache(sent):
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(list(sent)[-5000:], f, ensure_ascii=False)
 
-def article_id(link):
-    return hashlib.md5(link.encode()).hexdigest()
-
 def write_log(lines):
-    existing = []
-    if LOG_FILE.exists():
-        existing = LOG_FILE.read_text(encoding="utf-8").splitlines()
+    existing = LOG_FILE.read_text(encoding="utf-8").splitlines() if LOG_FILE.exists() else []
     all_lines = existing + lines
     LOG_FILE.write_text("\n".join(all_lines[-200:]), encoding="utf-8")
+
+def article_id(link):
+    return hashlib.md5(link.encode()).hexdigest()
 
 # ─────────────────────────────────────────
 # 네이버 / 텔레그램
@@ -89,7 +91,7 @@ def send_telegram(message, cfg):
     url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage"
     payload = {"chat_id": cfg["telegram_chat_id"], "text": message,
                "parse_mode": "HTML", "disable_web_page_preview": False}
-    res = requests.post(url, json=payload, timeout=10, verify=False)
+    res = requests.post(url, json=payload, timeout=15, verify=False)
     res.raise_for_status()
 
 def format_message(keyword, article):
@@ -111,67 +113,76 @@ def format_message(keyword, article):
     )
 
 # ─────────────────────────────────────────
-# 글로벌 백그라운드 스레드
+# 백그라운드 모니터링 (단일 스레드 보장)
 # ─────────────────────────────────────────
-_monitor_thread = None
-_stop_event     = threading.Event()
-
 def _monitor_loop():
-    while not _stop_event.is_set():
-        try:
-            cfg = load_config()
-            if not cfg.get("running"):
-                time.sleep(10)
-                continue
+    """단 하나의 스레드만 실행되도록 파일 플래그로 제어"""
+    # 이미 다른 스레드가 실행 중이면 즉시 종료
+    if THREAD_FLAG.exists():
+        return
+    THREAD_FLAG.write_text("running")
 
-            sent  = load_cache()
-            new_n = 0
-            ts    = datetime.now().strftime("%H:%M:%S")
-            lines = [f"[{ts}] === 검색 시작 ==="]
+    try:
+        while True:
+            try:
+                cfg = load_config()
+                if not cfg.get("running"):
+                    time.sleep(10)
+                    continue
 
-            for kw in cfg.get("keywords", []):
-                try:
-                    articles = search_naver(kw, cfg)
-                    lines.append(f"[{ts}] [{kw}] {len(articles)}건 검색")
-                    for art in articles:
-                        aid = article_id(art.get("link", ""))
-                        if aid in sent:
-                            continue
-                        try:
-                            send_telegram(format_message(kw, art), cfg)
-                            sent.add(aid)
-                            new_n += 1
-                            lines.append(f"[{ts}]   ✅ {clean_html(art.get('title',''))[:40]}")
-                            time.sleep(0.3)
-                        except Exception as e:
-                            lines.append(f"[{ts}]   ❌ 전송 오류: {e}")
-                except Exception as e:
-                    lines.append(f"[{ts}] [{kw}] 검색 오류: {e}")
-                time.sleep(0.5)
+                sent  = load_cache()
+                new_n = 0
+                ts    = datetime.now().strftime("%H:%M:%S")
+                lines = [f"[{ts}] === 검색 시작 ==="]
 
-            save_cache(sent)
-            lines.append(f"[{ts}] === 완료: 새 기사 {new_n}건 ===")
-            write_log(lines)
+                for kw in cfg.get("keywords", []):
+                    try:
+                        articles = search_naver(kw, cfg)
+                        lines.append(f"[{ts}] [{kw}] {len(articles)}건 검색")
+                        for art in articles:
+                            aid = article_id(art.get("link", ""))
+                            if aid in sent:
+                                continue
+                            try:
+                                send_telegram(format_message(kw, art), cfg)
+                                sent.add(aid)
+                                new_n += 1
+                                lines.append(f"[{ts}]   ✅ {clean_html(art.get('title',''))[:40]}")
+                                time.sleep(1)  # 텔레그램 rate limit 방지
+                            except Exception as e:
+                                lines.append(f"[{ts}]   ❌ 전송 오류: {e}")
+                                time.sleep(2)
+                    except Exception as e:
+                        lines.append(f"[{ts}] [{kw}] 검색 오류: {e}")
+                    time.sleep(1)
 
-            interval = cfg.get("interval_minutes", 10) * 60
-            for _ in range(interval):
-                if _stop_event.is_set():
-                    break
-                if not load_config().get("running"):
-                    break
-                time.sleep(1)
+                save_cache(sent)
+                lines.append(f"[{ts}] === 완료: 새 기사 {new_n}건 ===")
+                write_log(lines)
 
-        except Exception:
-            time.sleep(30)
+                # 다음 검색까지 대기 (1초씩 체크)
+                interval = load_config().get("interval_minutes", 10) * 60
+                for _ in range(interval):
+                    if not load_config().get("running"):
+                        break
+                    time.sleep(1)
 
-def ensure_monitor_thread():
-    global _monitor_thread
-    if _monitor_thread is None or not _monitor_thread.is_alive():
-        _stop_event.clear()
-        _monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
-        _monitor_thread.start()
+            except Exception as e:
+                write_log([f"[오류] {e}"])
+                time.sleep(30)
+    finally:
+        # 스레드 종료 시 플래그 삭제
+        if THREAD_FLAG.exists():
+            THREAD_FLAG.unlink()
 
-ensure_monitor_thread()
+def start_monitor():
+    """스레드가 없을 때만 새로 시작"""
+    if not THREAD_FLAG.exists():
+        t = threading.Thread(target=_monitor_loop, daemon=True)
+        t.start()
+
+# 앱 시작 시 실행 (플래그 없을 때만 스레드 생성)
+start_monitor()
 
 # ─────────────────────────────────────────
 # Streamlit UI
@@ -202,9 +213,9 @@ with col_status:
         st.markdown('<p class="status-stopped">⏹ 정지됨</p>', unsafe_allow_html=True)
 
 st.divider()
-
 tab1, tab2, tab3 = st.tabs(["⚙ 설정", "🔑 API 키", "📋 로그"])
 
+# ── 설정 탭 ──
 with tab1:
     st.subheader("검색 설정")
     col1, col2, col3 = st.columns(3)
@@ -218,7 +229,6 @@ with tab1:
 
     st.divider()
     st.subheader("키워드 관리")
-
     kw_col1, kw_col2 = st.columns([4, 1])
     with kw_col1:
         new_kw = st.text_input("키워드 입력", placeholder="예: 빙그레 -광고  /  삼성전자 실적",
@@ -257,7 +267,6 @@ with tab1:
             cfg["sort"]             = "date" if "date" in sort_opt else "sim"
             save_config(cfg)
             st.success("저장됐어요!")
-
     with btn2:
         if not cfg.get("running"):
             if st.button("▶ 모니터링 시작", use_container_width=True, type="primary"):
@@ -271,7 +280,7 @@ with tab1:
                     cfg["sort"]             = "date" if "date" in sort_opt else "sim"
                     cfg["running"]          = True
                     save_config(cfg)
-                    ensure_monitor_thread()
+                    start_monitor()
                     st.rerun()
         else:
             if st.button("⏹ 모니터링 중지", use_container_width=True):
@@ -279,11 +288,11 @@ with tab1:
                 save_config(cfg)
                 st.rerun()
 
+# ── API 키 탭 ──
 with tab2:
     st.subheader("네이버 API")
     naver_id     = st.text_input("Client ID",     value=cfg["naver_client_id"])
     naver_secret = st.text_input("Client Secret", value=cfg["naver_client_secret"], type="password")
-
     st.subheader("텔레그램")
     tg_token = st.text_input("Bot Token", value=cfg["telegram_bot_token"], type="password")
     tg_chat  = st.text_input("Chat ID",   value=cfg["telegram_chat_id"],
@@ -298,7 +307,6 @@ with tab2:
             cfg["telegram_chat_id"]    = tg_chat.strip()
             save_config(cfg)
             st.success("저장됐어요!")
-
     with col_test:
         if st.button("🔔 텔레그램 테스트 전송", use_container_width=True):
             test_cfg = {**cfg,
@@ -312,6 +320,7 @@ with tab2:
             except Exception as e:
                 st.error(f"전송 실패: {e}")
 
+# ── 로그 탭 ──
 with tab3:
     col_refresh, col_clear, _ = st.columns([1, 1, 4])
     with col_refresh:
@@ -324,6 +333,5 @@ with tab3:
 
     log_text = LOG_FILE.read_text(encoding="utf-8") if LOG_FILE.exists() else "로그가 없어요. 모니터링을 시작해 주세요."
     st.markdown(f'<div class="log-box">{log_text}</div>', unsafe_allow_html=True)
-
     if cfg.get("running"):
         st.caption("⏱ 로그를 보려면 새로고침 버튼을 눌러주세요.")
